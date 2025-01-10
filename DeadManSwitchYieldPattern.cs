@@ -1,4 +1,4 @@
-//For the record, l learned this pattern from  unity and python
+//For the record, l learned this pattern from Unity 5.> and python
 
 using System;
 using System.Collections.Generic;
