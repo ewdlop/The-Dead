@@ -658,4 +658,25 @@ namespace DeadLetterServiceBus
         }
     }
 }
+
+```
+
+## Require CSharpMiddleWare.js
+
+```javascript
+// Create a router
+const router = new DeadLetterRouter();
+
+// Register handler with C#-like syntax
+router.RegisterHandler("order.process", 
+    async (msg) => {
+        console.log(`Processing: ${msg.Content}`);
+        return true;
+    },
+    {
+        MaxRetries: 3,
+        InitialDelay: 1000,
+        BackoffMultiplier: 2
+    }
+);
 ```
