@@ -2,6 +2,354 @@
 
 ## Dead Man Swtich
 
+```csharp
+using System;
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace DeadManSwitch
+{
+    public enum SwitchState
+    {
+        Active,         // Normal operation
+        Warning,        // Missing heartbeat
+        Critical,       // Near timeout
+        Triggered,      // Switch activated
+        Maintenance,    // Under maintenance
+        Disabled,       // Switched off
+        Error          // System error
+    }
+
+    public class HeartbeatEvent
+    {
+        public DateTime Timestamp { get; set; }
+        public TimeSpan TimeSinceLastHeartbeat { get; set; }
+        public string Source { get; set; }
+        public SwitchState State { get; set; }
+    }
+
+    public class DeadMansSwitch : IDisposable
+    {
+        private readonly TimeSpan _warningThreshold;
+        private readonly TimeSpan _criticalThreshold;
+        private readonly TimeSpan _timeout;
+        private readonly Action _emergencyAction;
+        private readonly ConcurrentDictionary<string, DateTime> _lastHeartbeats;
+        private readonly ConcurrentQueue<HeartbeatEvent> _eventHistory;
+        private readonly CancellationTokenSource _cancellation;
+        private Timer _watchdogTimer;
+        private Timer _healthCheckTimer;
+        private volatile bool _isDisposed;
+        private readonly object _stateLock = new object();
+        private SwitchState _currentState = SwitchState.Active;
+        private readonly int _maxHistorySize = 1000;
+
+        public event EventHandler<HeartbeatEvent> OnStateChange;
+        public event EventHandler<HeartbeatEvent> OnHeartbeat;
+        public event EventHandler<HeartbeatEvent> OnEmergencyAction;
+
+        public DeadMansSwitch(
+            TimeSpan warningThreshold,
+            TimeSpan criticalThreshold,
+            TimeSpan timeout,
+            Action emergencyAction)
+        {
+            _warningThreshold = warningThreshold;
+            _criticalThreshold = criticalThreshold;
+            _timeout = timeout;
+            _emergencyAction = emergencyAction;
+            _lastHeartbeats = new ConcurrentDictionary<string, DateTime>();
+            _eventHistory = new ConcurrentQueue<HeartbeatEvent>();
+            _cancellation = new CancellationTokenSource();
+
+            ValidateConfiguration();
+            InitializeTimers();
+            StartHealthMonitoring();
+        }
+
+        private void ValidateConfiguration()
+        {
+            if (_warningThreshold >= _criticalThreshold)
+                throw new ArgumentException("Warning threshold must be less than critical threshold");
+            if (_criticalThreshold >= _timeout)
+                throw new ArgumentException("Critical threshold must be less than timeout");
+        }
+
+        private void InitializeTimers()
+        {
+            // Watchdog timer checks system state every second
+            _watchdogTimer = new Timer(
+                CheckState,
+                null,
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(1)
+            );
+
+            // Health check timer runs every minute
+            _healthCheckTimer = new Timer(
+                PerformHealthCheck,
+                null,
+                TimeSpan.FromMinutes(1),
+                TimeSpan.FromMinutes(1)
+            );
+        }
+
+        private void StartHealthMonitoring()
+        {
+            Task.Run(async () =>
+            {
+                while (!_cancellation.Token.IsCancellationRequested)
+                {
+                    MonitorSystemResources();
+                    await Task.Delay(TimeSpan.FromSeconds(30));
+                }
+            }, _cancellation.Token);
+        }
+
+        private void MonitorSystemResources()
+        {
+            var process = Process.GetCurrentProcess();
+            var memoryUsage = process.WorkingSet64;
+            var cpuTime = process.TotalProcessorTime;
+
+            // Log or act on resource usage
+            if (memoryUsage > 1_000_000_000) // 1GB
+            {
+                LogEvent(new HeartbeatEvent
+                {
+                    Timestamp = DateTime.UtcNow,
+                    Source = "ResourceMonitor",
+                    State = _currentState,
+                    TimeSinceLastHeartbeat = GetTimeSinceLastHeartbeat()
+                });
+            }
+        }
+
+        public void SendHeartbeat(string source = "default")
+        {
+            if (_isDisposed) return;
+
+            _lastHeartbeats.AddOrUpdate(
+                source,
+                DateTime.UtcNow,
+                (_, __) => DateTime.UtcNow
+            );
+
+            var heartbeatEvent = new HeartbeatEvent
+            {
+                Timestamp = DateTime.UtcNow,
+                Source = source,
+                State = _currentState,
+                TimeSinceLastHeartbeat = TimeSpan.Zero
+            };
+
+            LogEvent(heartbeatEvent);
+            OnHeartbeat?.Invoke(this, heartbeatEvent);
+        }
+
+        private void CheckState(object state)
+        {
+            if (_isDisposed) return;
+
+            var timeSinceLastHeartbeat = GetTimeSinceLastHeartbeat();
+            var newState = DetermineState(timeSinceLastHeartbeat);
+
+            if (newState != _currentState)
+            {
+                UpdateState(newState, timeSinceLastHeartbeat);
+            }
+        }
+
+        private TimeSpan GetTimeSinceLastHeartbeat()
+        {
+            if (!_lastHeartbeats.Any())
+                return TimeSpan.MaxValue;
+
+            var mostRecentHeartbeat = _lastHeartbeats.Values.Max();
+            return DateTime.UtcNow - mostRecentHeartbeat;
+        }
+
+        private SwitchState DetermineState(TimeSpan timeSinceLastHeartbeat)
+        {
+            if (_currentState == SwitchState.Maintenance || 
+                _currentState == SwitchState.Disabled)
+                return _currentState;
+
+            if (timeSinceLastHeartbeat >= _timeout)
+                return SwitchState.Triggered;
+            if (timeSinceLastHeartbeat >= _criticalThreshold)
+                return SwitchState.Critical;
+            if (timeSinceLastHeartbeat >= _warningThreshold)
+                return SwitchState.Warning;
+
+            return SwitchState.Active;
+        }
+
+        private void UpdateState(SwitchState newState, TimeSpan timeSinceLastHeartbeat)
+        {
+            lock (_stateLock)
+            {
+                if (_currentState == newState) return;
+
+                var previousState = _currentState;
+                _currentState = newState;
+
+                var stateChangeEvent = new HeartbeatEvent
+                {
+                    Timestamp = DateTime.UtcNow,
+                    Source = "StateManager",
+                    State = newState,
+                    TimeSinceLastHeartbeat = timeSinceLastHeartbeat
+                };
+
+                LogEvent(stateChangeEvent);
+                OnStateChange?.Invoke(this, stateChangeEvent);
+
+                if (newState == SwitchState.Triggered)
+                {
+                    TriggerEmergencyAction(timeSinceLastHeartbeat);
+                }
+            }
+        }
+
+        private void TriggerEmergencyAction(TimeSpan timeSinceLastHeartbeat)
+        {
+            try
+            {
+                _emergencyAction?.Invoke();
+
+                var emergencyEvent = new HeartbeatEvent
+                {
+                    Timestamp = DateTime.UtcNow,
+                    Source = "EmergencyAction",
+                    State = SwitchState.Triggered,
+                    TimeSinceLastHeartbeat = timeSinceLastHeartbeat
+                };
+
+                LogEvent(emergencyEvent);
+                OnEmergencyAction?.Invoke(this, emergencyEvent);
+            }
+            catch (Exception ex)
+            {
+                // Log emergency action failure
+                LogEvent(new HeartbeatEvent
+                {
+                    Timestamp = DateTime.UtcNow,
+                    Source = "Error",
+                    State = SwitchState.Error,
+                    TimeSinceLastHeartbeat = timeSinceLastHeartbeat
+                });
+            }
+        }
+
+        private void PerformHealthCheck(object state)
+        {
+            if (_isDisposed) return;
+
+            var healthCheckEvent = new HeartbeatEvent
+            {
+                Timestamp = DateTime.UtcNow,
+                Source = "HealthCheck",
+                State = _currentState,
+                TimeSinceLastHeartbeat = GetTimeSinceLastHeartbeat()
+            };
+
+            LogEvent(healthCheckEvent);
+        }
+
+        private void LogEvent(HeartbeatEvent evt)
+        {
+            _eventHistory.Enqueue(evt);
+
+            // Trim history if needed
+            while (_eventHistory.Count > _maxHistorySize)
+            {
+                _eventHistory.TryDequeue(out _);
+            }
+        }
+
+        public void EnterMaintenance()
+        {
+            UpdateState(SwitchState.Maintenance, GetTimeSinceLastHeartbeat());
+        }
+
+        public void ExitMaintenance()
+        {
+            UpdateState(SwitchState.Active, TimeSpan.Zero);
+            SendHeartbeat("MaintenanceExit");
+        }
+
+        public HeartbeatEvent[] GetEventHistory()
+        {
+            return _eventHistory.ToArray();
+        }
+
+        public void Dispose()
+        {
+            if (_isDisposed) return;
+            _isDisposed = true;
+
+            _watchdogTimer?.Dispose();
+            _healthCheckTimer?.Dispose();
+            _cancellation.Cancel();
+            _cancellation.Dispose();
+        }
+    }
+
+    // Example usage
+    class Program
+    {
+        static async Task Main()
+        {
+            using var deadManSwitch = new DeadMansSwitch(
+                warningThreshold: TimeSpan.FromSeconds(5),
+                criticalThreshold: TimeSpan.FromSeconds(8),
+                timeout: TimeSpan.FromSeconds(10),
+                emergencyAction: () => Console.WriteLine("🚨 Emergency procedures initiated!")
+            );
+
+            // Subscribe to events
+            deadManSwitch.OnStateChange += (s, e) =>
+                Console.WriteLine($"State changed to {e.State} at {e.Timestamp:HH:mm:ss}");
+
+            deadManSwitch.OnHeartbeat += (s, e) =>
+                Console.WriteLine($"Heartbeat received from {e.Source} at {e.Timestamp:HH:mm:ss}");
+
+            deadManSwitch.OnEmergencyAction += (s, e) =>
+                Console.WriteLine($"Emergency action triggered at {e.Timestamp:HH:mm:ss}");
+
+            // Normal operation
+            Console.WriteLine("Starting normal operation...");
+            for (int i = 0; i < 3; i++)
+            {
+                deadManSwitch.SendHeartbeat("MainLoop");
+                await Task.Delay(2000);
+            }
+
+            // Simulate maintenance
+            Console.WriteLine("\nEntering maintenance...");
+            deadManSwitch.EnterMaintenance();
+            await Task.Delay(6000);
+            deadManSwitch.ExitMaintenance();
+
+            // Simulate system problem
+            Console.WriteLine("\nSimulating system problem...");
+            await Task.Delay(12000);
+
+            // Display event history
+            Console.WriteLine("\nEvent History:");
+            foreach (var evt in deadManSwitch.GetEventHistory())
+            {
+                Console.WriteLine($"{evt.Timestamp:HH:mm:ss} - {evt.Source}: {evt.State}");
+            }
+        }
+    }
+}
+```
+
+
 ## Dead Letter
 
 ```csharp
