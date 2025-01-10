@@ -663,6 +663,8 @@ namespace DeadLetterServiceBus
 
 ## Require CSharpMiddleWare.js
 
+From:
+
 ```javascript
 // Create a router
 const router = new DeadLetterRouter();
@@ -680,3 +682,28 @@ router.RegisterHandler("order.process",
     }
 );
 ```
+
+To:
+
+```javascript
+var router = new DeadLetterRouter();
+
+// Register handler
+router.RegisterHandler("order.process", 
+    async msg => {
+        Console.WriteLine($"Processing: {msg.Content}");
+        return true;
+    },
+    new RetryPolicy {
+        MaxRetries = 3,
+        InitialDelay = TimeSpan.FromSeconds(1),
+        BackoffMultiplier = 2
+    }
+);
+
+// Route message
+await router.RouteMessage(new Message {
+    Content = "Order #1",
+    RoutingKey = "order.process"
+});
+‵‵
